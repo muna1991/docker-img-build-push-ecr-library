@@ -1,0 +1,104 @@
+name: "Docker image Build&Push Deployment"
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "Target environment for deployment"
+        required: true
+        type: string
+      image_name:
+        description: "Name of the Docker image"
+        required: true
+        type: string
+      tag_name:
+        description: "Tag name for docker image"
+        required: true
+        type: string
+      region:
+        description: "AWS region for the S3 bucket"
+        required: false
+        default: "ap-south-1"
+        type: string
+      account_id:
+        description: "Please provide the account ID"
+        required: true
+        type: int
+      ecr_name:
+        description: "please provide the ECR Name"
+        required: true
+        type: string
+    secrets:
+      aws_access_key_id:
+        required: true
+      aws_secret_access_key:
+        required: true
+      aws_session_token:
+        required: false
+
+jobs:
+  Docker-build:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Build Docker Image
+      run: |
+        echo "Building Docker image..."
+        docker build --no-cache -t ${{ inputs.image_name }}:${{ tag_name }} .
+  Trivy-Scan:
+    runs-on: self-hosted
+    needs: Docker-build
+    steps:
+    - name: Run Trivy Scan
+      id: trivy-scan
+      run: |
+        echo "Running Trivy scan on Docker image..."
+        trivy image \
+          --format table \
+          --exit-code 1 \
+          --ignore-unfixed \
+          --pkg-types os,library \
+          --severity CRITICAL \
+          my-app:latest > trivy-results.txt || true
+
+    - name: Check Vulnerabilities
+      id: vuln-check
+      run: |
+        critical_count=$(grep -oP 'CRITICAL:\s*\K\d+' trivy-results.txt)
+        if [[ "$critical_count" -eq 0 ]]; then
+          echo "No critical vulnerabilities found. Proceeding to execution."
+        else
+          echo "Critical vulnerabilities detected: $critical_count"
+          echo "Exiting to address the vulnerabilities."
+          exit 1  
+        fi 
+    - name: Upload Trivy Scan Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-scan-results
+        path: trivy-results.txt
+
+  push-to-ecr:
+    needs: trivy-scan
+    runs-on: self-hosted
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Authenticate with ECR
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
+        AWS_SESSION_TOKEN: ${{ secrets.aws_session_token }} # Replace with your region
+      run: |
+        echo "Authenticating with ECR..."
+        aws ecr get-login-password --region ${{ inputs.region }} | docker login --username AWS --password-stdin ${{ inputs.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com
+
+    - name: Push Docker Image to ECR
+      run: |
+        echo "Pushing Docker image to ECR..."
+        docker tag my-app:latest ${{ inputs.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ inputs.image_name}}:${{ inputs.tag_name }}
+        docker push ${{ inputs.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ inputs.image_name}}:${{ inputs.tag_name }}
